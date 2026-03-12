@@ -76,6 +76,8 @@ class PlaybackSessionService {
     required bool loop,
     bool includeSynonyms = false,
     bool includeAntonyms = false,
+    // optional segment callback (index, wordId, segmentId)
+    Future<void> Function(int currentIndex, int wordId, String segmentId)? onSegmentStart,
   }) async {
     await stop();
     final myToken = ++_token;
@@ -139,7 +141,34 @@ class PlaybackSessionService {
         includeAntonyms: includeAntonyms,
       );
 
-      await tts.speakSequence(items);
+      // Play item-by-item so we can call onSegmentStart BEFORE speaking
+      for (final it in items) {
+        if (myToken != _token) break;
+
+        // call segment callback BEFORE speaking so UI can scroll & highlight
+        if (onSegmentStart != null && it.segmentId != null) {
+          try {
+            await onSegmentStart(i, id, it.segmentId!);
+          } catch (_) {}
+        }
+
+        // If item text is empty => pause-only
+        final t = it.text.trim();
+        if (t.isEmpty) {
+          if (it.pauseMsAfter > 0) {
+            await Future.delayed(Duration(milliseconds: it.pauseMsAfter));
+          }
+          continue;
+        }
+
+        await tts.speak(t, it.langCode);
+        if (myToken != _token) break;
+
+        if (it.pauseMsAfter > 0) {
+          await Future.delayed(Duration(milliseconds: it.pauseMsAfter));
+        }
+      }
+
       if (myToken != _token) return;
 
       await settings.saveLastPlayedWordId(
@@ -165,6 +194,8 @@ class PlaybackSessionService {
     int startFromIndex = 0,
     Future<void> Function(int currentIndex, int wordId)? onProgress,
     Future<void> Function(int currentIndex, int wordId)? onWordStart,
+    // NEW: segment callback to notify UI before each segment plays
+    Future<void> Function(int currentIndex, int wordId, String segmentId)? onSegmentStart,
     bool includeSynonyms = false,
     bool includeAntonyms = false,
   }) async {
@@ -224,7 +255,32 @@ class PlaybackSessionService {
         includeAntonyms: includeAntonyms,
       );
 
-      await tts.speakSequence(items);
+      // Play item-by-item so we can call onSegmentStart BEFORE speaking
+      for (final it in items) {
+        if (myToken != _token) break;
+
+        if (onSegmentStart != null && it.segmentId != null) {
+          try {
+            await onSegmentStart(i, id, it.segmentId!);
+          } catch (_) {}
+        }
+
+        final t = it.text.trim();
+        if (t.isEmpty) {
+          if (it.pauseMsAfter > 0) {
+            await Future.delayed(Duration(milliseconds: it.pauseMsAfter));
+          }
+          continue;
+        }
+
+        await tts.speak(t, it.langCode);
+        if (myToken != _token) break;
+
+        if (it.pauseMsAfter > 0) {
+          await Future.delayed(Duration(milliseconds: it.pauseMsAfter));
+        }
+      }
+
       if (myToken != _token) return;
 
       if (onProgress != null) {
@@ -261,6 +317,7 @@ class PlaybackSessionService {
     bool includeSynonyms = false,
     bool includeAntonyms = false,
     int minutes = 0,
+    Future<void> Function(int currentIndex, int wordId, String segmentId)? onSegmentStart,
   }) async {
     await stop();
     final myToken = ++_token;
@@ -311,7 +368,7 @@ class PlaybackSessionService {
         continue;
       }
 
-      // play the sequence
+      // play the sequence (item-by-item so we can notify segment start)
       final items = buildWordSequence(
         wordL2: l2,
         wordL1: l1,
@@ -322,7 +379,31 @@ class PlaybackSessionService {
         includeAntonyms: includeAntonyms,
       );
 
-      await tts.speakSequence(items);
+      for (final it in items) {
+        if (myToken != _token) break;
+
+        if (onSegmentStart != null && it.segmentId != null) {
+          try {
+            await onSegmentStart(i, id, it.segmentId!);
+          } catch (_) {}
+        }
+
+        final t = it.text.trim();
+        if (t.isEmpty) {
+          if (it.pauseMsAfter > 0) {
+            await Future.delayed(Duration(milliseconds: it.pauseMsAfter));
+          }
+          continue;
+        }
+
+        await tts.speak(t, it.langCode);
+        if (myToken != _token) break;
+
+        if (it.pauseMsAfter > 0) {
+          await Future.delayed(Duration(milliseconds: it.pauseMsAfter));
+        }
+      }
+
       if (myToken != _token) return;
 
       // WAIT for user rating via submitRatingInt(...)
@@ -386,11 +467,12 @@ List<TtsItem> buildWordSequence({
 
   final w2 = (wordL2['word'] ?? '').toString();
   final w1 = (wordL1['word'] ?? '').toString();
+  final id = wordL2['id'] is int ? wordL2['id'] as int : -1;
 
   // ✅ Word first (L2)
-  items.add(TtsItem(text: w2, langCode: langCodeL2, pauseMsAfter: settings.pauseShortMs));
+  items.add(TtsItem(text: w2, langCode: langCodeL2, pauseMsAfter: settings.pauseShortMs, segmentId: 'word:$id'));
 
-  // ✅ Spelling optional AFTER word (FIXED: ONE item instead of letter-by-letter)
+  // ✅ Spelling optional AFTER word (ONE item)
   if (settings.speakSpelling) {
     final spellText = _spellAsOneText(w2, joiner: ' . ');
     if (spellText.trim().isNotEmpty) {
@@ -398,29 +480,30 @@ List<TtsItem> buildWordSequence({
         text: spellText,
         langCode: langCodeL2,
         pauseMsAfter: settings.pauseMediumMs,
+        segmentId: 'spell:$id',
       ));
     }
   }
 
   // Translation (L1)
-  items.add(TtsItem(text: w1, langCode: langCodeL1, pauseMsAfter: settings.pauseMediumMs));
+  items.add(TtsItem(text: w1, langCode: langCodeL1, pauseMsAfter: settings.pauseMediumMs, segmentId: 'trans:$id'));
 
   // Confirm L2 repeats
-  for (int i = 0; i < settings.confirmL2Repeats; i++) {
-    items.add(TtsItem(text: w2, langCode: langCodeL2, pauseMsAfter: settings.pauseMediumMs));
+  for (int r = 0; r < settings.confirmL2Repeats; r++) {
+    items.add(TtsItem(text: w2, langCode: langCodeL2, pauseMsAfter: settings.pauseMediumMs, segmentId: 'confirm:${id}_$r'));
   }
 
   // Definition (first)
   final defs2 = (wordL2['definitions'] is List) ? (wordL2['definitions'] as List) : const [];
   final defs1 = (wordL1['definitions'] is List) ? (wordL1['definitions'] as List) : const [];
-  final def2 = defs2.isNotEmpty ? (defs2.first['text'] ?? '').toString() : '';
-  final def1 = defs1.isNotEmpty ? (defs1.first['text'] ?? '').toString() : '';
+  final def2 = defs2.isNotEmpty ? (defs2.first is Map ? (defs2.first['text'] ?? '').toString() : defs2.first.toString()) : '';
+  final def1 = defs1.isNotEmpty ? (defs1.first is Map ? (defs1.first['text'] ?? '').toString() : defs1.first.toString()) : '';
 
   if (def2.trim().isNotEmpty) {
-    items.add(TtsItem(text: def2, langCode: langCodeL2, pauseMsAfter: settings.pauseShortMs));
+    items.add(TtsItem(text: def2, langCode: langCodeL2, pauseMsAfter: settings.pauseShortMs, segmentId: 'def:$id'));
   }
   if (def1.trim().isNotEmpty) {
-    items.add(TtsItem(text: def1, langCode: langCodeL1, pauseMsAfter: settings.pauseLongMs));
+    items.add(TtsItem(text: def1, langCode: langCodeL1, pauseMsAfter: settings.pauseLongMs, segmentId: 'def_l1:$id'));
   }
 
   // Sentences (N)
@@ -440,10 +523,10 @@ List<TtsItem> buildWordSequence({
 
     for (int r = 0; r < settings.sentenceRepeat; r++) {
       if (t2.trim().isNotEmpty) {
-        items.add(TtsItem(text: t2, langCode: langCodeL2, pauseMsAfter: settings.pauseShortMs));
+        items.add(TtsItem(text: t2, langCode: langCodeL2, pauseMsAfter: settings.pauseShortMs, segmentId: 'sent:${id}_$i'));
       }
       if (t1.trim().isNotEmpty) {
-        items.add(TtsItem(text: t1, langCode: langCodeL1, pauseMsAfter: settings.pauseLongMs));
+        items.add(TtsItem(text: t1, langCode: langCodeL1, pauseMsAfter: settings.pauseLongMs, segmentId: 'sent_l1:${id}_$i'));
       }
     }
   }
@@ -454,15 +537,15 @@ List<TtsItem> buildWordSequence({
     final syn1 = (wordL1['synonyms'] is List) ? (wordL1['synonyms'] as List) : const [];
     final map1 = <int, String>{};
     for (final x in syn1) {
-      final id = x['id'];
-      if (id is int) map1[id] = (x['text'] ?? '').toString();
+      final sid = x['id'];
+      if (sid is int) map1[sid] = (x['text'] ?? '').toString();
     }
     for (final x in syn2) {
-      final id = x['id'];
+      final sid = x['id'];
       final t2 = (x['text'] ?? '').toString();
-      final t1 = (id is int) ? (map1[id] ?? '') : '';
-      if (t2.trim().isNotEmpty) items.add(TtsItem(text: t2, langCode: langCodeL2, pauseMsAfter: settings.pauseShortMs));
-      if (t1.trim().isNotEmpty) items.add(TtsItem(text: t1, langCode: langCodeL1, pauseMsAfter: settings.pauseShortMs));
+      final t1 = (sid is int) ? (map1[sid] ?? '') : '';
+      if (t2.trim().isNotEmpty) items.add(TtsItem(text: t2, langCode: langCodeL2, pauseMsAfter: settings.pauseShortMs, segmentId: 'syn2:${id}_${sid ?? 'x'}'));
+      if (t1.trim().isNotEmpty) items.add(TtsItem(text: t1, langCode: langCodeL1, pauseMsAfter: settings.pauseShortMs, segmentId: 'syn1:${id}_${sid ?? 'x'}'));
     }
   }
 
@@ -471,15 +554,15 @@ List<TtsItem> buildWordSequence({
     final ant1 = (wordL1['antonyms'] is List) ? (wordL1['antonyms'] as List) : const [];
     final map1 = <int, String>{};
     for (final x in ant1) {
-      final id = x['id'];
-      if (id is int) map1[id] = (x['text'] ?? '').toString();
+      final sid = x['id'];
+      if (sid is int) map1[sid] = (x['text'] ?? '').toString();
     }
     for (final x in ant2) {
-      final id = x['id'];
+      final sid = x['id'];
       final t2 = (x['text'] ?? '').toString();
-      final t1 = (id is int) ? (map1[id] ?? '') : '';
-      if (t2.trim().isNotEmpty) items.add(TtsItem(text: t2, langCode: langCodeL2, pauseMsAfter: settings.pauseShortMs));
-      if (t1.trim().isNotEmpty) items.add(TtsItem(text: t1, langCode: langCodeL1, pauseMsAfter: settings.pauseShortMs));
+      final t1 = (sid is int) ? (map1[sid] ?? '') : '';
+      if (t2.trim().isNotEmpty) items.add(TtsItem(text: t2, langCode: langCodeL2, pauseMsAfter: settings.pauseShortMs, segmentId: 'ant2:${id}_${sid ?? 'x'}'));
+      if (t1.trim().isNotEmpty) items.add(TtsItem(text: t1, langCode: langCodeL1, pauseMsAfter: settings.pauseShortMs, segmentId: 'ant1:${id}_${sid ?? 'x'}'));
     }
   }
 

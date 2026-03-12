@@ -1,3 +1,4 @@
+// lib/main.dart
 import 'package:flutter/material.dart';
 import 'services/settings_controller.dart';
 import 'modules/home/home_page.dart';
@@ -16,12 +17,45 @@ class MyApp extends StatelessWidget {
   final SettingsController settings;
   const MyApp({super.key, required this.settings});
 
+  MaterialColor getAppColor(String color) {
+    switch (color) {
+      case 'green':
+        return Colors.green;
+      case 'red':
+        return Colors.red;
+      case 'purple':
+        return Colors.purple;
+      case 'orange':
+        return Colors.orange;
+      default:
+        return Colors.blue;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Closed Learning System',
-      debugShowCheckedModeBanner: false,
-      home: BootGate(settings: settings),
+    // AnimatedBuilder listens to SettingsController (ChangeNotifier) and rebuilds MaterialApp when it notifies.
+    return AnimatedBuilder(
+      animation: settings,
+      builder: (context, _) {
+        final baseTheme = ThemeData(
+          brightness: settings.darkMode ? Brightness.dark : Brightness.light,
+          primarySwatch: getAppColor(settings.appColor),
+        );
+
+        return MaterialApp(
+          title: 'Closed Learning System',
+          debugShowCheckedModeBanner: false,
+          theme: baseTheme,
+          // apply global textScale factor from settings by wrapping child into a MediaQuery
+          builder: (context, child) {
+            final mq = MediaQuery.of(context);
+            final scaled = mq.copyWith(textScaleFactor: settings.textScale);
+            return MediaQuery(data: scaled, child: child ?? const SizedBox.shrink());
+          },
+          home: BootGate(settings: settings),
+        );
+      },
     );
   }
 }

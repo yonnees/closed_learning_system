@@ -35,6 +35,10 @@ class SettingsController extends ChangeNotifier {
   // ✅ NEW: UI size
   UiSizeMode uiSizeMode = UiSizeMode.normal;
 
+  // ===== Appearance settings (NEW) =====
+  String appColor = 'blue'; // 'blue','green','red','purple','orange'
+  bool darkMode = false;
+
   // ===== Speed preset =====
   SpeechSpeed speechSpeed = SpeechSpeed.normal;
 
@@ -97,6 +101,10 @@ class SettingsController extends ChangeNotifier {
       uiSizeMode = UiSizeMode.values[uiSizeIndex];
     }
 
+    // Appearance
+    appColor = p.getString('appColor') ?? appColor;
+    darkMode = p.getBool('darkMode') ?? darkMode;
+
     final speedIndex = p.getInt('speechSpeed');
     if (speedIndex != null && speedIndex >= 0 && speedIndex < SpeechSpeed.values.length) {
       speechSpeed = SpeechSpeed.values[speedIndex];
@@ -134,6 +142,10 @@ class SettingsController extends ChangeNotifier {
     // ✅ UI size
     await p.setInt('uiSizeMode', uiSizeMode.index);
 
+    // Appearance
+    await p.setString('appColor', appColor);
+    await p.setBool('darkMode', darkMode);
+
     await p.setInt('speechSpeed', speechSpeed.index);
 
     await p.setInt('confirmL2Repeats', confirmL2Repeats);
@@ -166,6 +178,19 @@ class SettingsController extends ChangeNotifier {
   // =========================
   // UI Size helpers (استخدمها بدل الأرقام)
   // =========================
+
+  /// Returns a text scale factor (use in MediaQuery copyWith)
+  double get textScale {
+    switch (uiSizeMode) {
+      case UiSizeMode.compact:
+        return 0.9;
+      case UiSizeMode.large:
+        return 1.25;
+      case UiSizeMode.normal:
+      default:
+        return 1.0;
+    }
+  }
 
   int gridCountHome() {
     switch (uiSizeMode) {

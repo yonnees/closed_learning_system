@@ -171,6 +171,7 @@ class TtsService {
   }
 
   Future<void> speakSequence(List<TtsItem> items) async {
+    // kept for compatibility; it will still play items sequentially
     await init();
     final myToken = _token;
 
@@ -211,10 +212,12 @@ class TtsItem {
   final String text;
   final String langCode;
   final int pauseMsAfter;
+  final String? segmentId; // NEW: id used by UI to highlight / scroll
 
   TtsItem({
     required this.text,
     required this.langCode,
     this.pauseMsAfter = 250,
+    this.segmentId,
   });
 }

@@ -9,9 +9,9 @@ import '../../services/tts_service.dart';
 import '../../services/playback_session_service.dart';
 import '../../services/favorites_service.dart';
 import '../../services/srs_service.dart';
+import '../../services/course_progress_service.dart';
 
 import 'widgets/bilingual_pairs_wrap.dart';
-import 'widgets/sentence_item.dart';
 
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -53,32 +53,177 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
 
   bool get _sameLang => widget.nativeLang == widget.targetLang;
 
-  // Cache for sidebar word titles (L2)
   final Map<int, Future<Map<String, dynamic>?>> _l2TitleCache = {};
 
-  // Favorites
   Set<int> _favorites = {};
   bool _favoritesLoaded = false;
 
-  // Scroll controllers for Sheet and Sidebar (fix Scrollbar exception)
   final ScrollController _sheetScrollController = ScrollController();
   final ScrollController _sidebarScrollController = ScrollController();
+  final ScrollController _contentScrollController = ScrollController();
 
-  // ===== Test / Course mastery state =====
   bool _testRunning = false;
   bool _courseMastered = false;
 
-  // Local session results
   final List<_TestResult> _testSessionResults = [];
-
-  // Abort flag (allows user to quit test anytime)
   bool _testAbort = false;
 
-  // ===== Persist last test summary so it doesn't "disappear" =====
   int _lastTestTotal = 0;
   int _lastTestCorrect = 0;
   int _lastTestPercent = 0;
   List<_TestResult> _lastWrongResults = [];
+
+  String? _highlightSegmentId;
+  final Map<String, GlobalKey> _segmentKeys = {};
+
+  GlobalKey _getKeyForSegment(String segId) {
+    return _segmentKeys.putIfAbsent(segId, () => GlobalKey());
+  }
+
+  Future<void> _ensureSegmentVisible(String segmentId, {bool longScroll = false}) async {
+    final key = _segmentKeys[segmentId];
+    if (key == null || key.currentContext == null) return;
+
+    try {
+      await Scrollable.ensureVisible(
+        key.currentContext!,
+        duration: Duration(milliseconds: longScroll ? 320 : 220),
+        curve: Curves.easeInOut,
+        alignment: 0.18,
+      );
+    } catch (_) {}
+  }
+
+  Future<void> _activateSegment(
+    String segmentId, {
+    bool scrollFirst = true,
+    bool longScroll = false,
+    int preSpeakDelayMs = 140,
+  }) async {
+    if (!mounted) return;
+
+    setState(() {
+      _highlightSegmentId = segmentId;
+    });
+
+    await Future.delayed(const Duration(milliseconds: 40));
+
+    if (scrollFirst) {
+      await _ensureSegmentVisible(segmentId, longScroll: longScroll);
+    }
+
+    if (preSpeakDelayMs > 0) {
+      await Future.delayed(Duration(milliseconds: preSpeakDelayMs));
+    }
+  }
+
+  Future<void> _speakSegment({
+    required String text,
+    required String langCode,
+    required String segmentId,
+    bool clearAfter = true,
+    bool longScroll = false,
+  }) async {
+    final t = text.trim();
+    if (t.isEmpty) return;
+
+    if (_autoRunning) {
+      await _stopAuto();
+    }
+
+    await _tts.stop();
+    await _applySpeed();
+
+    await _activateSegment(
+      segmentId,
+      scrollFirst: true,
+      longScroll: longScroll,
+      preSpeakDelayMs: 140,
+    );
+
+    await _tts.speak(t, langCode);
+
+    if (clearAfter && mounted) {
+      await Future.delayed(const Duration(milliseconds: 60));
+      _clearHighlight();
+    }
+  }
+
+  Future<void> _speakSpellingSegment({
+    required String word,
+    required String langCode,
+    required String segmentId,
+    bool clearAfter = true,
+  }) async {
+    final w = word.trim();
+    if (w.isEmpty) return;
+
+    if (_autoRunning) {
+      await _stopAuto();
+    }
+
+    final letters = _spellLetters(w);
+    if (letters.isEmpty) return;
+
+    final spellingText = letters.join(' ');
+
+    await _tts.stop();
+    await _tts.configure(
+      speechRate: widget.settings.speechRateValue,
+      pitch: widget.settings.pitch,
+      volume: widget.settings.volume,
+    );
+
+    await _activateSegment(
+      segmentId,
+      scrollFirst: true,
+      longScroll: false,
+      preSpeakDelayMs: 140,
+    );
+
+    await _tts.speak(spellingText, langCode);
+
+    if (clearAfter && mounted) {
+      await Future.delayed(const Duration(milliseconds: 60));
+      _clearHighlight();
+    }
+  }
+
+  Future<void> _onSegmentStart(int currentIndex, int wordId, String segmentId) async {
+    if (!mounted) return;
+
+    if (currentIndex != _index) {
+      setState(() {
+        _index = currentIndex;
+      });
+      await _loadCurrentWord();
+
+      await Future.delayed(const Duration(milliseconds: 70));
+
+      await _activateSegment(
+        'word:$wordId',
+        scrollFirst: true,
+        longScroll: true,
+        preSpeakDelayMs: 180,
+      );
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _highlightSegmentId = segmentId;
+    });
+
+    await Future.delayed(const Duration(milliseconds: 35));
+    await _ensureSegmentVisible(segmentId);
+  }
+
+  void _clearHighlight() {
+    if (!mounted) return;
+    if (_highlightSegmentId == null) return;
+    setState(() {
+      _highlightSegmentId = null;
+    });
+  }
 
   @override
   void initState() {
@@ -89,7 +234,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     _loadFavorites();
     _loadCourseMastered();
 
-    // Warm-up (help web tts latency)
     Future.microtask(() async {
       try {
         await _applySpeed();
@@ -104,12 +248,10 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     _session.stop();
     _sheetScrollController.dispose();
     _sidebarScrollController.dispose();
+    _contentScrollController.dispose();
     super.dispose();
   }
 
-  // =========================
-  // Course mastered persistence
-  // =========================
   String _courseMasteredKey() =>
       'course_mastered_${widget.nativeLang}_${widget.targetLang}_${widget.levelKey}_c${widget.courseIndex}';
 
@@ -134,9 +276,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     setState(() => _courseMastered = false);
   }
 
-  // =========================
-  // Favorites
-  // =========================
   Future<void> _loadFavorites() async {
     final set = await FavoritesService.instance.getFavorites(
       nativeLang: widget.nativeLang,
@@ -161,7 +300,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
       l2: l2Text,
     );
 
-    // reload local favorites for this language pair
     await _loadFavorites();
 
     if (!mounted) return;
@@ -185,13 +323,32 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
       _l2 = l2;
       _l1 = l1;
     });
+
+    _getKeyForSegment('word:$id');
+    _getKeyForSegment('trans:$id');
+    _getKeyForSegment('def:$id');
+    _getKeyForSegment('def_l1:$id');
+    _getKeyForSegment('spell:$id');
+
+    final s2 = _sentences(l2, 5);
+    final s1 = _sameLang ? const <String>[] : _sentences(l1, 5);
+
+    for (int i = 0; i < s2.length; i++) {
+      _getKeyForSegment('sent:$id:$i:l2');
+      _getKeyForSegment('sent:$id:$i:l1');
+    }
+
+    for (int i = 0; i < s2.length; i++) {
+      _getKeyForSegment('sent:${id}_$i');
+      _getKeyForSegment('sent_l1:${id}_$i');
+      _getKeyForSegment('sent_tr:${id}_$i');
+    }
   }
 
   Future<Map<String, dynamic>?> _loadL2Title(int id) {
     return _l2TitleCache[id] ??= LanguageLoader.loadWordById(widget.targetLang, id);
   }
 
-  // --------- helpers ----------
   String _word(Map<String, dynamic>? m) => (m?['word'] ?? '').toString();
 
   String _firstDef(Map<String, dynamic>? m) {
@@ -225,7 +382,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     return map;
   }
 
-  // ---------- Speed ----------
   String _speedLabel(SpeechSpeed s) {
     switch (s) {
       case SpeechSpeed.slow3x:
@@ -269,7 +425,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     if (mounted) setState(() {});
   }
 
-  // ---------- speak helpers ----------
   Future<void> _speakSingle(String text, String langCode) async {
     final t = text.trim();
     if (t.isEmpty) return;
@@ -279,9 +434,7 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     await _tts.stop();
     await _applySpeed();
 
-    await _tts.speakSequence([
-      TtsItem(text: t, langCode: langCode, pauseMsAfter: widget.settings.pauseShortMs),
-    ]);
+    await _tts.speak(t, langCode);
   }
 
   List<String> _spellLetters(String word) {
@@ -313,7 +466,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     await _tts.speak(spellingText, langCode);
   }
 
-  // --------- navigation ----------
   Future<void> _goPrev() async {
     if (_index <= 0) return;
 
@@ -343,12 +495,14 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     await _loadCurrentWord();
   }
 
-  // --------- AUTO ----------
   Future<void> _startAutoFromHere() async {
     if (_autoRunning) return;
 
     await _tts.stop();
     setState(() => _autoRunning = true);
+    _clearHighlight();
+
+    await _applySpeed();
 
     await _session.startSessionForIds(
       ids: widget.courseIds,
@@ -372,18 +526,34 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
           courseIndex: widget.courseIndex,
           wordIndexInCourse: idx,
         );
+
+        await CourseProgressService.saveCompletedWords(
+          nativeLang: widget.nativeLang,
+          targetLang: widget.targetLang,
+          levelKey: widget.levelKey,
+          courseIndex: widget.courseIndex,
+          completedWords: idx + 1,
+        );
+      },
+      onSegmentStart: (idx, wordId, segId) async {
+        await _onSegmentStart(idx, wordId, segId);
       },
     );
 
-    if (mounted) setState(() => _autoRunning = false);
+    if (mounted) {
+      setState(() {
+        _autoRunning = false;
+        _clearHighlight();
+      });
+    }
   }
 
   Future<void> _stopAuto() async {
     await _session.stop();
+    _clearHighlight();
     if (mounted) setState(() => _autoRunning = false);
   }
 
-  // ---------- UI helpers ----------
   void _openWordsSheet() {
     if (_autoRunning) return;
 
@@ -441,7 +611,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
                               trailing: Row(
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
-                                  // Favorite star
                                   IconButton(
                                     icon: Icon(
                                       isFav ? Icons.star : Icons.star_outline,
@@ -474,10 +643,11 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
 
   Widget _speedWidget() {
     return Container(
+      height: 54,
       padding: const EdgeInsets.symmetric(horizontal: 8),
       decoration: BoxDecoration(
         border: Border.all(color: Colors.grey.shade300),
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(14),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
@@ -487,9 +657,15 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
             icon: const Icon(Icons.remove),
             onPressed: () => _speedDown(),
           ),
-          Text(
-            _speedLabel(widget.settings.speechSpeed),
-            style: const TextStyle(fontWeight: FontWeight.bold),
+          Expanded(
+            child: Center(
+              child: Text(
+                _speedLabel(widget.settings.speechSpeed),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
           ),
           IconButton(
             tooltip: 'Faster',
@@ -555,11 +731,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     );
   }
 
-  // =========================
-  // ====== Quick Course Test (Definition -> Choose word) ======
-  // =========================
-
-  // Prepare question IDs from current course (shuffled). If course length < requested count, use course length.
   Future<List<int>> _prepareCourseQuestionIds({required int count}) async {
     final ids = List<int>.from(widget.courseIds);
     ids.shuffle();
@@ -567,9 +738,8 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     return ids;
   }
 
-  // Build options: correct id + 3 distractors from outside current course (preferred)
   Future<List<int>> _buildDefinitionOptionsFromOtherCourses(int correctId, {int needed = 3}) async {
-    final allWords = await LanguageLoader.loadWords(widget.targetLang); // full list
+    final allWords = await LanguageLoader.loadWords(widget.targetLang);
     final pool = <int>[];
     for (final w in allWords) {
       final id = w['id'];
@@ -584,7 +754,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
       picked.add(id);
     }
 
-    // Fallback: if not enough outside-course words, pick from other ids in course (last resort)
     if (picked.length < needed) {
       final alt = widget.courseIds.where((i) => i != correctId).toList()..shuffle();
       for (final id in alt) {
@@ -596,7 +765,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     return picked;
   }
 
-  // Map response time to SrsGrade (thresholds: <=1200 easy, <=4000 good, >4000 hard)
   SrsGrade _mapResponseToGrade(bool correct, int responseMs) {
     if (!correct) return SrsGrade.again;
     if (responseMs <= 1200) return SrsGrade.easy;
@@ -604,7 +772,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     return SrsGrade.hard;
   }
 
-  // Localization helper for Quit label
   String _localizedQuitLabel() {
     final ui = (widget.settings.uiLanguage ?? 'english').toLowerCase();
     switch (ui) {
@@ -623,36 +790,56 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     }
   }
 
-  // Ask one question: show definition, speak it (if autoplay), then show options and measure response time.
   Future<_QuestionOutcome> _askDefinitionQuestion(int wordId) async {
-    // Reset abort for this question check (but global _testAbort controls overall)
-    if (_testAbort) return _QuestionOutcome(wordId: wordId, answered: false, chosenId: -1, correct: false, responseMs: 0, graded: SrsGrade.again);
+    if (_testAbort) {
+      return _QuestionOutcome(
+        wordId: wordId,
+        answered: false,
+        chosenId: -1,
+        correct: false,
+        responseMs: 0,
+        graded: SrsGrade.again,
+      );
+    }
 
-    // Load words
     final l2 = await LanguageLoader.loadWordById(widget.targetLang, wordId);
     final l1 = _sameLang ? l2 : await LanguageLoader.loadWordById(widget.nativeLang, wordId);
-    if (l2 == null) return _QuestionOutcome(wordId: wordId, answered: false, chosenId: -1, correct: false, responseMs: 0, graded: SrsGrade.again);
+    if (l2 == null) {
+      return _QuestionOutcome(
+        wordId: wordId,
+        answered: false,
+        chosenId: -1,
+        correct: false,
+        responseMs: 0,
+        graded: SrsGrade.again,
+      );
+    }
 
-    // Determine definition text (prefer L2 definition; fallback to L1)
     String defText = '';
     final defs2 = (l2['definitions'] is List) ? (l2['definitions'] as List) : const [];
     if (defs2.isNotEmpty) {
       final f = defs2.first;
-      if (f is String) defText = f;
-      else if (f is Map && f.containsKey('text')) defText = (f['text'] ?? '').toString();
-      else defText = f.toString();
+      if (f is String) {
+        defText = f;
+      } else if (f is Map && f.containsKey('text')) {
+        defText = (f['text'] ?? '').toString();
+      } else {
+        defText = f.toString();
+      }
     } else {
-      // fallback to L1 def if available
       final defs1 = (l1?['definitions'] is List) ? (l1!['definitions'] as List) : const [];
       if (defs1.isNotEmpty) {
         final f = defs1.first;
-        if (f is String) defText = f;
-        else if (f is Map && f.containsKey('text')) defText = (f['text'] ?? '').toString();
-        else defText = f.toString();
+        if (f is String) {
+          defText = f;
+        } else if (f is Map && f.containsKey('text')) {
+          defText = (f['text'] ?? '').toString();
+        } else {
+          defText = f.toString();
+        }
       }
     }
 
-    // Build options
     final distractors = await _buildDefinitionOptionsFromOtherCourses(wordId, needed: 3);
     final optionIds = <int>[wordId] + distractors;
     optionIds.shuffle();
@@ -662,15 +849,12 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     bool buttonsEnabled = false;
     final sw = Stopwatch();
 
-    // Show dialog with definition first, then play TTS if enabled, then reveal options and start stopwatch
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) {
         return StatefulBuilder(builder: (context, setStateDialog) {
-          // start speaking automatically when dialog builds first time
           Future.microtask(() async {
-            // ensure we only start speaking once
             if (!buttonsEnabled && !_testAbort) {
               try {
                 await _applySpeed();
@@ -678,7 +862,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
                   await _tts.speak(defText, LanguageLoader.langCode(widget.targetLang));
                 }
               } catch (_) {}
-              // After TTS finished (or immediately if empty), reveal options and start stopwatch
               if (!mounted) return;
               setStateDialog(() {
                 buttonsEnabled = true;
@@ -688,7 +871,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
             }
           });
 
-          // Build options widgets
           final optionButtons = optionIds.map((id) {
             return FutureBuilder<Map<String, dynamic>?>(
               future: _loadL2Title(id),
@@ -718,7 +900,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
                 const Expanded(child: Text('Question')),
                 TextButton(
                   onPressed: () {
-                    // user wants to quit the whole test
                     _testAbort = true;
                     Navigator.of(ctx).pop();
                   },
@@ -772,7 +953,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     final answered = chosenId != -1;
     final correct = chosenId == wordId;
 
-    // Map to grade and record via SrsService (immediate)
     final grade = _mapResponseToGrade(correct, responseMs);
     try {
       await SrsService().grade(
@@ -781,9 +961,7 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
         wordId: wordId,
         grade: grade,
       );
-    } catch (_) {
-      // ignore grading errors
-    }
+    } catch (_) {}
 
     return _QuestionOutcome(
       wordId: wordId,
@@ -795,10 +973,9 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     );
   }
 
-  // Start a test for the current course. Count = number of questions (default = course length or 10)
   Future<void> _startCourseDefinitionTest({int? count}) async {
     if (_testRunning) return;
-    // stop other sessions
+
     await _stopAuto();
     await _session.stop();
 
@@ -808,7 +985,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
       _testAbort = false;
     });
 
-    // decide number of questions
     final desired = count ?? min(10, max(1, widget.courseIds.length));
     final ids = await _prepareCourseQuestionIds(count: desired);
 
@@ -825,7 +1001,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
         grade: outcome.graded,
       ));
       if (outcome.correct) correctCount++;
-      // small delay for UX
       await Future.delayed(const Duration(milliseconds: 400));
       if (_testAbort) break;
     }
@@ -836,18 +1011,31 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     final total = _testSessionResults.length;
     final percent = total == 0 ? 0 : ((correctCount / total) * 100).round();
 
-    // Save mastery if >= 80%
     if (percent >= 80) {
       await _markCourseMastered();
     }
 
-    // Persist last test summary so it doesn't disappear
     _lastTestTotal = total;
     _lastTestCorrect = correctCount;
     _lastTestPercent = percent;
     _lastWrongResults = _testSessionResults.where((r) => !r.correct).toList();
 
-    // Show summary dialog with colored result & wrong items list
+    await CourseProgressService.saveLastTestPercent(
+      nativeLang: widget.nativeLang,
+      targetLang: widget.targetLang,
+      levelKey: widget.levelKey,
+      courseIndex: widget.courseIndex,
+      percent: percent,
+    );
+
+    await CourseProgressService.saveWrongWordIds(
+      nativeLang: widget.nativeLang,
+      targetLang: widget.targetLang,
+      levelKey: widget.levelKey,
+      courseIndex: widget.courseIndex,
+      ids: _lastWrongResults.map((e) => e.wordId).toList(),
+    );
+
     _showTestSummary(correctCount: correctCount, total: total, percent: percent);
   }
 
@@ -858,7 +1046,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
   }
 
   Future<void> _showTestSummary({required int correctCount, required int total, required int percent}) async {
-    // Build wrong items list (those with correct == false)
     final wrongResults = _testSessionResults.where((r) => !r.correct).toList();
 
     if (!mounted) return;
@@ -869,7 +1056,7 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
         return AlertDialog(
           title: Row(
             children: [
-              Expanded(child: Text('Test Summary')),
+              const Expanded(child: Text('Test Summary')),
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                 decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(8)),
@@ -886,7 +1073,7 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
                   const Text('Great! No mistakes.')
                 else ...[
                   const SizedBox(height: 8),
-                  Text('Wrong items (tap to review):', style: const TextStyle(fontWeight: FontWeight.bold)),
+                  const Text('Wrong items (tap to review):', style: TextStyle(fontWeight: FontWeight.bold)),
                   const SizedBox(height: 8),
                   Wrap(
                     spacing: 8,
@@ -900,7 +1087,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
                             backgroundColor: Colors.red[50],
                             label: Text(txt, style: const TextStyle(color: Colors.red)),
                             onPressed: () {
-                              // open mistake detail directly (dialog)
                               Navigator.of(ctx).pop();
                               _showMistakeDetail(r);
                             },
@@ -917,19 +1103,19 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
             if (wrongResults.isNotEmpty)
               TextButton(
                 onPressed: () {
-                  // do NOT clear stored last results — open review page while keeping the summary saved
                   Navigator.of(ctx).pop();
-                  // open review page for persistent review
-                  Navigator.of(context).push(MaterialPageRoute(builder: (_) => ReviewMistakesPage(
-                    wrongResults: _lastWrongResults,
-                    targetLang: widget.targetLang,
-                    nativeLang: widget.nativeLang,
-                    session: _session,
-                    settings: widget.settings,
-                    onReturn: () {
-                      // no changes to last results; user can re-open summary
-                    },
-                  )));
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => ReviewMistakesPage(
+                        wrongResults: _lastWrongResults,
+                        targetLang: widget.targetLang,
+                        nativeLang: widget.nativeLang,
+                        session: _session,
+                        settings: widget.settings,
+                        onReturn: () {},
+                      ),
+                    ),
+                  );
                 },
                 child: const Text('Review wrong items'),
               ),
@@ -943,8 +1129,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     );
   }
 
-  // When user taps a wrong item in the summary, show a learning dialog:
-  // show the wrong chosen word (red) and the correct word + definition to learn from error
   Future<void> _showMistakeDetail(_TestResult r) async {
     final correctId = r.wordId;
     final chosenId = r.chosenId;
@@ -958,16 +1142,24 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     final defs2 = (correctL2?['definitions'] is List) ? (correctL2!['definitions'] as List) : const [];
     if (defs2.isNotEmpty) {
       final f = defs2.first;
-      if (f is String) correctDef = f;
-      else if (f is Map && f.containsKey('text')) correctDef = (f['text'] ?? '').toString();
-      else correctDef = f.toString();
+      if (f is String) {
+        correctDef = f;
+      } else if (f is Map && f.containsKey('text')) {
+        correctDef = (f['text'] ?? '').toString();
+      } else {
+        correctDef = f.toString();
+      }
     } else {
       final defs1 = (correctL1?['definitions'] is List) ? (correctL1!['definitions'] as List) : const [];
       if (defs1.isNotEmpty) {
         final f = defs1.first;
-        if (f is String) correctDef = f;
-        else if (f is Map && f.containsKey('text')) correctDef = (f['text'] ?? '').toString();
-        else correctDef = f.toString();
+        if (f is String) {
+          correctDef = f;
+        } else if (f is Map && f.containsKey('text')) {
+          correctDef = (f['text'] ?? '').toString();
+        } else {
+          correctDef = f.toString();
+        }
       }
     }
 
@@ -1030,7 +1222,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
             TextButton(
               onPressed: () async {
                 Navigator.of(ctx).pop();
-                // Optionally, start TTS for correct definition to reinforce learning
                 if (correctDef.trim().isNotEmpty) {
                   await _applySpeed();
                   await _tts.speak(correctDef, LanguageLoader.langCode(widget.targetLang));
@@ -1043,8 +1234,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
       },
     );
   }
-
-  // ---------- Speed / Demo end ----------
 
   @override
   Widget build(BuildContext context) {
@@ -1078,47 +1267,104 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
 
     final progressValue = widget.courseIds.isEmpty ? 0.0 : (_index + 1) / widget.courseIds.length;
 
+    final currentId = _currentId;
+
     return LayoutBuilder(
       builder: (context, c) {
-        final isWide = c.maxWidth >= 900; // split view for wide screens
+        final isWide = c.maxWidth >= 900;
         final sidebarW = min(280.0, max(200.0, c.maxWidth * 0.26));
+        final bool compactTopBar = c.maxWidth < 760;
 
-        final topControls = Row(
-          children: [
-            OutlinedButton.icon(
-              icon: const Icon(Icons.chevron_left),
-              label: const Text('Prev'),
-              onPressed: _index <= 0 ? null : _goPrev,
-            ),
-            SizedBox(width: gap),
-            if (!isWide)
-              OutlinedButton.icon(
-                icon: const Icon(Icons.list),
-                label: const Text('Words'),
-                onPressed: isWide ? null : _openWordsSheet,
-              ),
-            SizedBox(width: gap),
-            _speedWidget(),
-            SizedBox(width: gap),
-            Expanded(
-              child: ElevatedButton.icon(
-                icon: const Icon(Icons.play_arrow),
-                label: Text(_autoRunning ? 'Auto Running...' : 'Auto From Here • $progressText'),
-                onPressed: _autoRunning ? null : _startAutoFromHere,
-              ),
-            ),
-            SizedBox(width: gap),
-            OutlinedButton.icon(
-              icon: const Icon(Icons.chevron_right),
-              label: const Text('Next'),
-              onPressed: _index >= widget.courseIds.length - 1 ? null : _goNext,
-            ),
-          ],
+        Widget prevButton = SizedBox(
+          width: compactTopBar ? 120 : 130,
+          height: 54,
+          child: OutlinedButton.icon(
+            icon: const Icon(Icons.chevron_left),
+            label: const Text('Prev'),
+            onPressed: _index <= 0 ? null : _goPrev,
+          ),
         );
 
+        Widget wordsButton = SizedBox(
+          width: compactTopBar ? 140 : 130,
+          height: 54,
+          child: OutlinedButton.icon(
+            icon: const Icon(Icons.list),
+            label: const Text('Words'),
+            onPressed: isWide ? null : _openWordsSheet,
+          ),
+        );
+
+        Widget speedBox = SizedBox(
+          width: compactTopBar ? 230 : 250,
+          child: _speedWidget(),
+        );
+
+        Widget autoButton = SizedBox(
+          width: compactTopBar ? double.infinity : 320,
+          height: 54,
+          child: ElevatedButton.icon(
+            icon: const Icon(Icons.play_arrow),
+            label: Text(
+              _autoRunning ? 'Auto Running...' : 'Auto From Here • $progressText',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            onPressed: _autoRunning ? null : _startAutoFromHere,
+          ),
+        );
+
+        Widget nextButton = SizedBox(
+          width: compactTopBar ? 120 : 130,
+          height: 54,
+          child: OutlinedButton.icon(
+            icon: const Icon(Icons.chevron_right),
+            label: const Text('Next'),
+            onPressed: _index >= widget.courseIds.length - 1 ? null : _goNext,
+          ),
+        );
+
+        final topControls = compactTopBar
+            ? Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Wrap(
+                    spacing: gap,
+                    runSpacing: gap,
+                    alignment: WrapAlignment.start,
+                    children: [
+                      prevButton,
+                      if (!isWide) wordsButton,
+                      speedBox,
+                    ],
+                  ),
+                  SizedBox(height: gap),
+                  Row(
+                    children: [
+                      Expanded(child: autoButton),
+                      SizedBox(width: gap),
+                      nextButton,
+                    ],
+                  ),
+                ],
+              )
+            : Row(
+                children: [
+                  prevButton,
+                  SizedBox(width: gap),
+                  if (!isWide) wordsButton,
+                  SizedBox(width: gap),
+                  speedBox,
+                  SizedBox(width: gap),
+                  Expanded(child: autoButton),
+                  SizedBox(width: gap),
+                  nextButton,
+                ],
+              );
+
         final content = ListView(
+          controller: _contentScrollController,
           children: [
-            // Progress
             Row(
               children: [
                 Expanded(
@@ -1136,11 +1382,8 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
               ],
             ),
             SizedBox(height: gap),
-
             topControls,
             SizedBox(height: gap),
-
-            // Options card
             Card(
               child: Padding(
                 padding: EdgeInsets.all(pad),
@@ -1175,10 +1418,7 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
                 ),
               ),
             ),
-
             SizedBox(height: gap),
-
-            // Word card
             Card(
               child: Padding(
                 padding: EdgeInsets.all(pad),
@@ -1188,22 +1428,53 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
                     Row(
                       children: [
                         Expanded(
-                          child: Text(
-                            w2.isEmpty ? '...' : w2,
-                            style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+                          child: Container(
+                            key: _getKeyForSegment('word:$currentId'),
+                            decoration: _highlightSegmentId == 'word:$currentId'
+                                ? BoxDecoration(
+                                    color: Colors.yellow.withOpacity(0.30),
+                                    borderRadius: BorderRadius.circular(6),
+                                  )
+                                : null,
+                            padding: const EdgeInsets.all(4),
+                            child: Text(
+                              w2.isEmpty ? '...' : w2,
+                              style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+                            ),
                           ),
                         ),
                         IconButton(
                           tooltip: 'Speak word (L2)',
                           icon: const Icon(Icons.volume_up),
-                          onPressed: _autoRunning ? null : () async => _speakSingle(w2, lc2),
+                          onPressed: _autoRunning
+                              ? null
+                              : () async => _speakSegment(
+                                    text: w2,
+                                    langCode: lc2,
+                                    segmentId: 'word:$currentId',
+                                  ),
                         ),
-                        IconButton(
-                          tooltip: 'Spell (L2)',
-                          icon: const Icon(Icons.spellcheck),
-                          onPressed: _autoRunning ? null : () async => _speakSpellingOnly(w2, lc2),
+                        Container(
+                          key: _getKeyForSegment('spell:$currentId'),
+                          decoration: _highlightSegmentId == 'spell:$currentId'
+                              ? BoxDecoration(
+                                  color: Colors.orange.withOpacity(0.22),
+                                  borderRadius: BorderRadius.circular(6),
+                                )
+                              : null,
+                          padding: const EdgeInsets.symmetric(horizontal: 2),
+                          child: IconButton(
+                            tooltip: 'Spell (L2)',
+                            icon: const Icon(Icons.spellcheck),
+                            onPressed: _autoRunning
+                                ? null
+                                : () async => _speakSpellingSegment(
+                                      word: w2,
+                                      langCode: lc2,
+                                      segmentId: 'spell:$currentId',
+                                    ),
+                          ),
                         ),
-                        // Favorite button for current word
                         IconButton(
                           tooltip: _favorites.contains(_currentId) ? 'Remove from Favorites' : 'Add to Favorites',
                           icon: Icon(
@@ -1219,21 +1490,36 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
                       Row(
                         children: [
                           Expanded(
-                            child: Text(
-                              w1,
-                              style: TextStyle(fontSize: 18, color: Colors.grey[800]),
+                            child: Container(
+                              key: _getKeyForSegment('trans:$currentId'),
+                              decoration: _highlightSegmentId == 'trans:$currentId'
+                                  ? BoxDecoration(
+                                      color: Colors.yellow.withOpacity(0.25),
+                                      borderRadius: BorderRadius.circular(6),
+                                    )
+                                  : null,
+                              padding: const EdgeInsets.all(4),
+                              child: Text(
+                                w1,
+                                style: TextStyle(fontSize: 18, color: Colors.grey[800]),
+                              ),
                             ),
                           ),
                           IconButton(
                             tooltip: 'Speak translation (L1)',
                             icon: const Icon(Icons.volume_up),
-                            onPressed: _autoRunning ? null : () async => _speakSingle(w1, lc1),
+                            onPressed: _autoRunning
+                                ? null
+                                : () async => _speakSegment(
+                                      text: w1,
+                                      langCode: lc1,
+                                      segmentId: 'trans:$currentId',
+                                    ),
                           ),
                         ],
                       ),
                     ],
                     const SizedBox(height: 8),
-                    // Course Test button (placed inside word card for visibility)
                     Row(
                       children: [
                         ElevatedButton.icon(
@@ -1245,7 +1531,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
                           onPressed: _courseMastered || _testRunning
                               ? null
                               : () {
-                                  // default: number of questions = course length but max 10
                                   final desired = min(10, max(1, widget.courseIds.length));
                                   _openCourseTestConfirm(count: desired);
                                 },
@@ -1254,12 +1539,14 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
                         if (_courseMastered)
                           Text('متقن', style: TextStyle(color: Colors.green[800], fontWeight: FontWeight.bold)),
                         const Spacer(),
-                        // Show last results button (if a last test exists)
                         if (_lastTestTotal > 0)
                           TextButton.icon(
                             onPressed: () {
-                              // reopen the last results dialog
-                              _showTestSummary(correctCount: _lastTestCorrect, total: _lastTestTotal, percent: _lastTestPercent);
+                              _showTestSummary(
+                                correctCount: _lastTestCorrect,
+                                total: _lastTestTotal,
+                                percent: _lastTestPercent,
+                              );
                             },
                             icon: const Icon(Icons.history),
                             label: const Text('Show Last Results'),
@@ -1270,10 +1557,7 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
                 ),
               ),
             ),
-
             SizedBox(height: gap),
-
-            // Definition
             if (def2.trim().isNotEmpty || (!_sameLang && def1.trim().isNotEmpty))
               Card(
                 child: Padding(
@@ -1284,37 +1568,66 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
                       const Text('Definition', style: TextStyle(fontWeight: FontWeight.bold)),
                       const SizedBox(height: 8),
                       if (def2.trim().isNotEmpty)
-                        Row(
-                          children: [
-                            Expanded(child: Text(def2)),
-                            IconButton(
-                              tooltip: 'Speak definition (L2)',
-                              icon: const Icon(Icons.volume_up),
-                              onPressed: _autoRunning ? null : () async => _speakSingle(def2, lc2),
-                            ),
-                          ],
+                        Container(
+                          key: _getKeyForSegment('def:$currentId'),
+                          decoration: _highlightSegmentId == 'def:$currentId'
+                              ? BoxDecoration(
+                                  color: Colors.yellow.withOpacity(0.25),
+                                  borderRadius: BorderRadius.circular(6),
+                                )
+                              : null,
+                          padding: const EdgeInsets.all(6),
+                          child: Row(
+                            children: [
+                              Expanded(child: Text(def2)),
+                              IconButton(
+                                tooltip: 'Speak definition (L2)',
+                                icon: const Icon(Icons.volume_up),
+                                onPressed: _autoRunning
+                                    ? null
+                                    : () async => _speakSegment(
+                                          text: def2,
+                                          langCode: lc2,
+                                          segmentId: 'def:$currentId',
+                                        ),
+                              ),
+                            ],
+                          ),
                         ),
                       if (!_sameLang && def1.trim().isNotEmpty) ...[
                         const Divider(),
-                        Row(
-                          children: [
-                            Expanded(child: Text(def1)),
-                            IconButton(
-                              tooltip: 'Speak definition (L1)',
-                              icon: const Icon(Icons.volume_up),
-                              onPressed: _autoRunning ? null : () async => _speakSingle(def1, lc1),
-                            ),
-                          ],
+                        Container(
+                          key: _getKeyForSegment('def_l1:$currentId'),
+                          decoration: _highlightSegmentId == 'def_l1:$currentId'
+                              ? BoxDecoration(
+                                  color: Colors.yellow.withOpacity(0.22),
+                                  borderRadius: BorderRadius.circular(6),
+                                )
+                              : null,
+                          padding: const EdgeInsets.all(6),
+                          child: Row(
+                            children: [
+                              Expanded(child: Text(def1)),
+                              IconButton(
+                                tooltip: 'Speak definition (L1)',
+                                icon: const Icon(Icons.volume_up),
+                                onPressed: _autoRunning
+                                    ? null
+                                    : () async => _speakSegment(
+                                          text: def1,
+                                          langCode: lc1,
+                                          segmentId: 'def_l1:$currentId',
+                                        ),
+                              ),
+                            ],
+                          ),
                         ),
                       ],
                     ],
                   ),
                 ),
               ),
-
             SizedBox(height: gap),
-
-            // Sentences
             if (s2.isNotEmpty)
               Card(
                 child: Padding(
@@ -1324,24 +1637,86 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
                     children: [
                       const Text('Sentences', style: TextStyle(fontWeight: FontWeight.bold)),
                       const SizedBox(height: 8),
-                      for (int i = 0; i < s2.length; i++)
-                        SentenceItem(
-                          s2: s2[i],
-                          s1: (!_sameLang && i < s1.length) ? s1[i] : '',
-                          sameLang: _sameLang,
-                          onSpeakL2: _autoRunning ? null : () async => _speakSingle(s2[i], lc2),
-                          onSpeakL1: (_autoRunning || _sameLang || i >= s1.length)
-                              ? null
-                              : () async => _speakSingle(s1[i], lc1),
+                      for (int i = 0; i < s2.length; i++) ...[
+                        Container(
+                          key: _getKeyForSegment('sent:$currentId:$i:l2'),
+                          decoration: (_highlightSegmentId == 'sent:$currentId:$i:l2' ||
+                                  _highlightSegmentId == 'sent:${currentId}_$i')
+                              ? BoxDecoration(
+                                  color: Colors.yellow.withOpacity(0.25),
+                                  borderRadius: BorderRadius.circular(6),
+                                )
+                              : null,
+                          padding: const EdgeInsets.all(6),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  s2[i],
+                                  style: const TextStyle(fontSize: 16),
+                                ),
+                              ),
+                              IconButton(
+                                tooltip: 'Speak sentence (L2)',
+                                icon: const Icon(Icons.volume_up),
+                                onPressed: _autoRunning
+                                    ? null
+                                    : () async => _speakSegment(
+                                          text: s2[i],
+                                          langCode: lc2,
+                                          segmentId: 'sent:$currentId:$i:l2',
+                                        ),
+                              ),
+                            ],
+                          ),
                         ),
+                        if (!_sameLang && i < s1.length)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 4, bottom: 8),
+                            child: Container(
+                              key: _getKeyForSegment('sent:$currentId:$i:l1'),
+                              decoration: (_highlightSegmentId == 'sent:$currentId:$i:l1' ||
+                                      _highlightSegmentId == 'sent_l1:${currentId}_$i' ||
+                                      _highlightSegmentId == 'sent_tr:${currentId}_$i')
+                                  ? BoxDecoration(
+                                      color: Colors.lightGreen.withOpacity(0.24),
+                                      borderRadius: BorderRadius.circular(6),
+                                    )
+                                  : null,
+                              padding: const EdgeInsets.all(6),
+                              child: Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      s1[i],
+                                      style: TextStyle(fontSize: 15, color: Colors.grey[800]),
+                                    ),
+                                  ),
+                                  IconButton(
+                                    tooltip: 'Speak sentence translation (L1)',
+                                    icon: const Icon(Icons.volume_up),
+                                    onPressed: _autoRunning
+                                        ? null
+                                        : () async => _speakSegment(
+                                              text: s1[i],
+                                              langCode: lc1,
+                                              segmentId: 'sent:$currentId:$i:l1',
+                                            ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          )
+                        else
+                          const SizedBox(height: 8),
+                      ],
                     ],
                   ),
                 ),
               ),
-
             SizedBox(height: gap),
-
-            // Synonyms / Antonyms
             BilingualPairsWrap(
               title: 'Synonyms (Manual)',
               l2Items: syn2,
@@ -1352,9 +1727,7 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
                 await _speakSingle(text, isL2 ? lc2 : lc1);
               },
             ),
-
             SizedBox(height: gap),
-
             BilingualPairsWrap(
               title: 'Antonyms (Manual)',
               l2Items: ant2,
@@ -1365,7 +1738,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
                 await _speakSingle(text, isL2 ? lc2 : lc1);
               },
             ),
-
             const SizedBox(height: 30),
           ],
         );
@@ -1404,8 +1776,6 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
     );
   }
 
-  // ========= Test UI helpers =========
-
   void _openCourseTestConfirm({required int count}) {
     if (_autoRunning || _testRunning) return;
     showModalBottomSheet(
@@ -1442,13 +1812,9 @@ class _CourseLessonPageState extends State<CourseLessonPage> {
   }
 }
 
-// =====================
-// Helper classes
-// =====================
-
 class _TestResult {
-  final int wordId; // correct target id
-  final int chosenId; // chosen option id (may be -1 if skipped/quit)
+  final int wordId;
+  final int chosenId;
   final bool correct;
   final int responseMs;
   final SrsGrade grade;
@@ -1478,7 +1844,6 @@ class _QuestionOutcome {
   });
 }
 
-// Review page: persistent list of wrong items and review actions
 class ReviewMistakesPage extends StatelessWidget {
   final List<_TestResult> wrongResults;
   final String targetLang;
@@ -1510,7 +1875,6 @@ class ReviewMistakesPage extends StatelessWidget {
             onPressed: wrongIds.isEmpty
                 ? null
                 : () {
-                    // start session for wrong ids (fire-and-forget)
                     unawaited(session.startSessionForIds(
                       ids: wrongIds,
                       targetLang: targetLang,
@@ -1539,7 +1903,6 @@ class ReviewMistakesPage extends StatelessWidget {
                 trailing: IconButton(
                   icon: const Icon(Icons.visibility),
                   onPressed: () {
-                    // open small detail dialog
                     showDialog<void>(
                       context: context,
                       builder: (ctx) {
@@ -1548,8 +1911,11 @@ class ReviewMistakesPage extends StatelessWidget {
                           content: FutureBuilder<Map<String, dynamic>?>(
                             future: LanguageLoader.loadWordById(nativeLang, r.wordId),
                             builder: (c2, snap2) {
-                              final def = (snap.data?['definitions'] is List && (snap.data!['definitions'] as List).isNotEmpty)
-                                  ? (((snap.data!['definitions'] as List).first is Map) ? ((snap.data!['definitions'] as List).first['text'] ?? '') : ((snap.data!['definitions'] as List).first.toString()))
+                              final def = (snap.data?['definitions'] is List &&
+                                      (snap.data!['definitions'] as List).isNotEmpty)
+                                  ? (((snap.data!['definitions'] as List).first is Map)
+                                      ? ((snap.data!['definitions'] as List).first['text'] ?? '')
+                                      : ((snap.data!['definitions'] as List).first.toString()))
                                   : '';
                               final trans = (snap2.data?['word'] ?? '').toString();
                               return Column(
@@ -1600,5 +1966,4 @@ class ReviewMistakesPage extends StatelessWidget {
   }
 }
 
-// Small utility to allow using unawaited where used
 void unawaited(Future<void> f) {}

@@ -105,39 +105,54 @@ class FavoritesService {
   }
 
   /// Toggle favorite for the given language pair.
-  /// When adding, we also remove the same id from any other favorites_* keys to prevent duplicates.
-  Future<void> toggleFavorite({
+  /// Returns true on success, false on failure.
+  Future<bool> toggleFavorite({
     required String nativeLang,
     required String targetLang,
     required int id,
     String? l1,
     String? l2,
   }) async {
-    final prefs = await SharedPreferences.getInstance();
-    final key = _keyFor(nativeLang, targetLang);
-    final metaKey = _metaKeyFor(nativeLang, targetLang);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final key = _keyFor(nativeLang, targetLang);
+      final metaKey = _metaKeyFor(nativeLang, targetLang);
 
-    // Read current set robustly
-    final set = await getFavorites(nativeLang: nativeLang, targetLang: targetLang);
+      // Read current set robustly
+      final set = await getFavorites(nativeLang: nativeLang, targetLang: targetLang);
 
-    final idKey = id.toString();
-    final willRemove = set.contains(id);
+      final idKey = id.toString();
+      final willRemove = set.contains(id);
 
-    if (willRemove) {
-      // remove from current pair and meta
-      set.remove(id);
-      await _writeFavoritesSet(prefs, key, set);
-      await _removeMetaEntry(prefs, metaKey, idKey);
-      return;
-    } else {
-      // add to current pair and meta
-      set.add(id);
-      await _writeFavoritesSet(prefs, key, set);
-      await _writeMetaEntry(prefs, metaKey, idKey, l1 ?? '', l2 ?? '');
+      if (willRemove) {
+        // remove from current pair and meta
+        set.remove(id);
+        await _writeFavoritesSet(prefs, key, set);
+        await _removeMetaEntry(prefs, metaKey, idKey);
+        return true;
+      } else {
+        // add to current pair and meta
+        set.add(id);
+        await _writeFavoritesSet(prefs, key, set);
+        await _writeMetaEntry(prefs, metaKey, idKey, l1 ?? '', l2 ?? '');
 
-      // remove same id from other pairs
-      await _removeIdFromOtherPairs(prefs, excludeNative: nativeLang, excludeTarget: targetLang, id: id);
-      return;
+        // remove same id from other pairs (best-effort)
+        try {
+          await _removeIdFromOtherPairs(
+            prefs,
+            excludeNative: nativeLang,
+            excludeTarget: targetLang,
+            id: id,
+          );
+        } catch (_) {
+          // non-fatal: ignore, but continue success
+        }
+
+        return true;
+      }
+    } catch (e) {
+      // On any error return false (caller will revert optimistic UI)
+      return false;
     }
   }
 
